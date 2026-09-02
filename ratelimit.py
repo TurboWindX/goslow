@@ -16,20 +16,22 @@ SCOPE_FILE = os.getenv("SCOPE", "/etc/mitmproxy/scope.txt")
 STATS_FILE = os.getenv("STATS_HTTP", "/tmp/goslow-http-stats.json")
 STATS_EVERY = 1.0
 
-# --- Adaptive back-off (ON BY DEFAULT; disable with --fixed / ADAPT=0) ----------------------
-# A safety governor, not a throughput optimizer: the configured rate is a CEILING the effective
-# rate can only drop BELOW, never exceed. By default it STARTS AT the ceiling (you asked for N
-# req/s, you get N) and only pulls below it if the target actually struggles, then recovers back
-# up. It watches the target the way TCP congestion control watches a link — by DELAY and LOSS,
-# not status codes (a struggling server rarely sends a clean 429/503; it just gets slow, then
-# stops answering). Signals, strongest first: connection loss/timeout, a request stalled with no
-# answer, and per-host latency rising vs its own healthy baseline (windowed low-percentile RTT).
-# On distress: multiplicative decrease (AIMD); when quiet: slow additive recovery toward the
-# ceiling. SLOW_START (--slow-start) instead begins at the floor and ramps UP for an unknown,
-# possibly fragile target. --fixed disables the governor entirely (exact, reproducible N req/s).
-# Everything is surfaced in `goslow top`.
+# --- Adaptive gauge (ON BY DEFAULT; disable with --fixed / ADAPT=0) --------------------------
+# An auto-gauge that finds the target's safe rate for you. `--rate` is a CEILING the effective
+# rate can never exceed; by default goslow starts LOW and ramps UP toward that ceiling, and if the
+# target starts to struggle before it gets there, it settles just below the strain — so it lands
+# at whichever is smaller, your ceiling or the target's real capacity. It watches the target the
+# way TCP congestion control watches a link — by DELAY and LOSS, not status codes (a struggling
+# server rarely sends a clean 429/503; it just gets slow, then stops answering). Signals, strongest
+# first: connection loss/timeout, a request stalled with no answer, and per-host latency rising vs
+# its own healthy baseline (windowed low-percentile RTT). Ramp/recover is ADDITIVE (never overshoot
+# the safe point); back-off on distress is multiplicative (AIMD). This is the whole "figure out how
+# hard I can push without hurting it" behavior — it's also the safest, since it never slams an
+# unknown target with a full-rate opening burst. SLOW_START=0 (undocumented) instead starts AT the
+# ceiling and only backs off — reproducible for tests, but overshoots a fragile target. --fixed
+# disables the governor entirely (exact, reproducible N req/s). Everything surfaced in `goslow top`.
 ADAPT = os.getenv("ADAPT", "1") == "1"
-SLOW_START = os.getenv("SLOW_START", "0") == "1"
+SLOW_START = os.getenv("SLOW_START", "1") == "1"  # default: gauge UP from the floor to the ceiling
 ADAPT_MIN = float(os.getenv("ADAPT_MIN", str(max(1.0, RATE * 0.1))))  # floor: never throttle below this
 WARMUP = float(os.getenv("ADAPT_WARMUP", "3"))       # observe-only seconds to learn a baseline
 WINDOW = float(os.getenv("ADAPT_WINDOW", "10"))      # rolling seconds for the min-RTT baseline
@@ -50,12 +52,12 @@ class RateLimiter:
         # rate = current EFFECTIVE rate (adapts down); ceiling = the hard cap it never exceeds.
         self.ceiling = RATE
         self.floor = min(ADAPT_MIN, RATE)
-        # Start point: by default (adaptive or fixed) begin AT the ceiling with a full burst, so a
-        # user who asked for N req/s gets N and the governor only pulls BELOW on measured distress.
-        # --slow-start instead begins at the floor with a floor-sized burst so the first wave can't
-        # slam an unknown target before the controller's first tick, then ramps UP while healthy
-        # (additive, not exponential — exponential overshoots a fragile target's safe point then
-        # has to slam the brakes).
+        # Start point: by DEFAULT (the gauge) begin at the FLOOR with a floor-sized burst and ramp
+        # UP additively while the target looks healthy — so the first wave can't slam an unknown
+        # target before the controller's first tick, and the ramp finds the safe rate without
+        # overshooting it (additive, not exponential — exponential jumps past a fragile target's
+        # safe point then has to slam the brakes). SLOW_START=0 (undocumented, tests only) instead
+        # opens AT the ceiling and only backs off. --fixed keeps the full burst, no governor.
         if ADAPT and SLOW_START:
             self.rate = self.capacity = self.tokens = self.floor
             self.slow_start = True
@@ -63,12 +65,10 @@ class RateLimiter:
             self.rate, self.capacity = RATE, BURST
             self.slow_start = False
             if ADAPT:
-                # Adaptive default: run AT the ceiling, but do NOT hand out a full second's worth of
-                # tokens at t=0. A full burst would admit RATE requests simultaneously and could tip
-                # a fragile target past its concurrency cliff before the controller's first tick (a
-                # stall cascade the governor then can't undo — easing the admission rate doesn't
-                # drain requests already hung on the server). Start the bucket near-empty; it refills
-                # at RATE/s, so throughput still reaches RATE within ~1s but the opening is smooth.
+                # start-AT-ceiling (SLOW_START=0): run at the ceiling but don't hand out a full
+                # second of tokens at t=0 — a full burst admits RATE requests at once and could tip
+                # a fragile target past its concurrency cliff before the first tick. Start near-empty;
+                # it refills at RATE/s so throughput still reaches RATE within ~1s, opening smooth.
                 self.tokens = self.floor
             else:
                 self.tokens = BURST  # fixed mode keeps the full burst (exact, reproducible)
@@ -299,7 +299,7 @@ def load(loader):
     if not ADAPT:
         mode = "fixed (hard cap, no back-off)"
     elif SLOW_START:
-        mode = "adaptive slow-start: floor %g/s -> ceiling %g/s, backs off on latency/loss" % (limiter.floor, limiter.ceiling)
+        mode = "adaptive gauge: ramps %g/s -> ceiling %g/s, settles at the target's safe rate" % (limiter.floor, limiter.ceiling)
     else:
         mode = "adaptive: start %g/s (ceiling), floor %g/s, backs off on latency/loss" % (limiter.ceiling, limiter.floor)
     log.info("[ratelimit] cap=%s req/s burst=%s scope=%s (%d hosts, %d nets) [%s]",

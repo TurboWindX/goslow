@@ -62,11 +62,10 @@ frontends, listing its **CIDR** is most airtight.
 
 | flag | env | default | meaning |
 |------|-----|---------|---------|
-| `--rate N` (or positional) | `RATE` | 20 | req/s (HTTP) **and** conn/s (non-HTTP) cap; both queue over-cap traffic |
+| `--rate N` (or positional) | `RATE` | 20 | **ceiling**: req/s (HTTP) **and** conn/s (non-HTTP); the gauge ramps up to it; over-cap traffic queues |
 | `--ports LIST` | `PORTS` | `80,443` | tcp ports treated as HTTP → mitmproxy; rest → TCP pacer (queued conn cap) |
 | `--refresh SEC` | `REFRESH` | 30 | re-resolve hostnames every SEC (0=off) |
-| `--fixed` | `ADAPT=0` | off | disable the adaptive governor: hold **exactly** `--rate`, never back off (reproducible) |
-| `--slow-start` | `SLOW_START=1` | off | adaptive, but **start at a floor and ramp up** to `--rate` (extra-cautious for unknown/fragile targets) |
+| `--fixed` | `ADAPT=0` | off | disable the adaptive gauge: hold **exactly** `--rate`, never ramp or back off (reproducible) |
 | `--http-only` | | off | proxy HTTP ports only; leave other ports unthrottled |
 | `--coarse` | | off | iptables-only conn cap on ALL ports (no proxy/CA) |
 | `--no-install` | `NO_INSTALL=1` | off | don't apt-get missing deps |
@@ -78,41 +77,48 @@ only when the proxies can't run (mitmproxy won't install, a tool breaks on the M
 DROPs over-rate connections (lossy) and caps *connections* not *requests*, so keepalive/HTTP2
 web tools slip past.
 
-## Adaptive back-off (on by default)
+## Adaptive gauge (on by default)
 
-The HTTP rate is **adaptive by default**. You set `--rate N`; goslow *starts at N* (you asked for
-N req/s, you get N) and treats it as a **ceiling the effective rate can only fall below, never
-exceed**. It only pulls below N if the target actually struggles, then recovers back up to N:
+The HTTP rate is an **adaptive gauge by default** — it figures out how hard it can push the target
+for you. It **starts low and ramps up**, climbing while the target stays healthy and **settling
+just below the point where it starts to struggle**. `--rate N` is only a **ceiling it never
+exceeds** (default 20), so it lands at whichever is smaller: your ceiling or the target's real
+capacity. Just point it at the scope and go:
 
 ```bash
-sudo goslow scope.txt 100      # start at 100/s; back off below only if 100 hurts the target
-sudo goslow --fixed scope.txt 100   # hold exactly 100/s, no back-off (reproducible report runs)
-sudo goslow --slow-start scope.txt 100  # start low and ramp UP to 100 (unknown/fragile target)
+sudo goslow scope.txt          # gauge up toward 20/s; settle lower if the target strains first
+sudo goslow scope.txt 100      # same, but allow it to climb as high as 100/s
+sudo goslow --fixed scope.txt 100   # skip the gauge: hold exactly 100/s (reproducible report runs)
 ```
 
-It's a **safety governor, not a throughput optimizer**. It watches the target like TCP congestion
-control watches a link: by **delay and loss**, not status codes (a struggling server rarely returns
-a clean 429/503 — it just gets slow, then stops answering). Signals, strongest first:
+It watches the target like TCP congestion control watches a link: by **delay and loss**, not status
+codes (a struggling server rarely returns a clean 429/503 — it just gets slow, then stops
+answering). Signals, strongest first:
 
 1. **connection loss / timeout** (no answer) — hard back-off;
 2. **a request stalled** with no reply past a threshold — hard back-off;
 3. **latency rising** vs each host's own healthy baseline (windowed low-percentile RTT) — ease off before it errors.
 
+The ramp (and any recovery after a back-off) is **additive** — one small step per tick — so it
+approaches the safe rate without overshooting it; an exponential ramp would jump past a fragile
+target's limit and then have to slam the brakes. Back-off on distress is multiplicative (AIMD).
+Because it opens at a floor rather than dumping a full second of requests at once, it also can't
+slam an unknown target on the first wave — the gauge is the **safest** default as well as the
+hands-off one.
+
 Latency is measured from **admission** (the moment goslow lets a request through) to the response,
 never from when the request arrived — otherwise goslow's own queue wait would count as "server
 latency" and throttling would look like distress, a feedback loop. The baseline is a low percentile
 (≈p20) of recent RTTs, not the raw minimum, so a jittery-but-healthy server's lucky-fast sample
-doesn't make normal variance read as distress. On distress it halves the rate (AIMD multiplicative
-decrease); when things are quiet it climbs back toward the ceiling additively.
+doesn't make normal variance read as distress.
 
-`--slow-start` changes only the *start*: instead of opening at the ceiling it begins at the floor
-with a small burst and ramps *up* while the target looks healthy — for a target you don't want the
-first wave to slam. `--fixed` disables the governor entirely.
+`--fixed` disables the gauge entirely: it holds exactly `--rate` from the first request and never
+ramps or backs off — use it for reproducible, report-grade runs where you want an exact number.
 
 Everything is visible in `goslow top` (effective vs ceiling rate, current server latency vs
-baseline, losses, and the reason it's backing off). Tunable via env: `ADAPT_MIN` (floor, default
-10% of ceiling), `ADAPT_SOFT`/`ADAPT_HARD` (latency ratios), `ADAPT_STALL` (no-answer seconds),
-`ADAPT_WARMUP`, `ADAPT_WINDOW`. HTTP only — the non-HTTP TCP pacer stays at the fixed cap.
+baseline, losses, and the reason it's ramping or backing off). Tunable via env: `ADAPT_MIN` (floor,
+default 10% of ceiling), `ADAPT_SOFT`/`ADAPT_HARD` (latency ratios), `ADAPT_STALL` (no-answer
+seconds), `ADAPT_WARMUP`, `ADAPT_WINDOW`. HTTP only — the non-HTTP TCP pacer stays at the fixed cap.
 
 ## Watch it work
 

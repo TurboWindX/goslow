@@ -53,8 +53,7 @@ type Config struct {
 	Tag       string // refresher process marker (for fallback pattern-kill)
 	Coarse    bool
 	HTTPOnly  bool
-	Fixed     bool // disable the adaptive governor (exact, reproducible hard cap)
-	SlowStart bool // adaptive + ramp up from the floor instead of starting at the ceiling
+	Fixed     bool // disable the adaptive gauge (exact, reproducible hard cap)
 	NoInstall bool
 }
 
@@ -171,10 +170,9 @@ func parseArgs(cfg *Config, args []string) (scope string) {
 			cfg.HTTPOnly = true
 		case a == "--fixed":
 			cfg.Fixed = true
-		case a == "--slow-start":
-			cfg.SlowStart = true
-		case a == "--adapt":
-			// adaptive is the default now; keep --adapt as an accepted no-op so old muscle
+		case a == "--slow-start" || a == "--adapt":
+			// The adaptive gauge (ramp up, find the safe rate) is the default now, which is
+			// exactly what these used to request — keep them as accepted no-ops so old muscle
 			// memory / scripts don't break.
 		case a == "--no-install":
 			cfg.NoInstall = true
@@ -205,9 +203,6 @@ func parseArgs(cfg *Config, args []string) (scope string) {
 	}
 	if len(pos) >= 2 {
 		cfg.Rate = pos[1] // positional rate, like the original script
-	}
-	if cfg.Fixed && cfg.SlowStart {
-		die("--fixed and --slow-start are mutually exclusive")
 	}
 	return scope
 }
@@ -248,17 +243,17 @@ token per chunk), all lossless. So a hydra brute against a scoped IP is throttle
 even over its handful of reused connections — and keeps working (just slower). You don't have to
 know which services are behind it. (Server replies/downloads are not gated; only what you send.)
 
-By DEFAULT the HTTP rate is ADAPTIVE: --rate is the starting rate AND a ceiling — you get your
-N req/s, and goslow only pulls BELOW N if the target actually slows down or drops connections
-(delay+loss driven, AIMD, never exceeds N), then recovers back to N. Watch it in 'goslow top'.
-Use --fixed for an exact, reproducible cap; --slow-start to ramp up from a floor on an unknown target.
+By DEFAULT the HTTP rate is an ADAPTIVE GAUGE: it ramps UP from a low rate and finds the target's
+safe speed for you — climbing until latency rises or connections drop (delay+loss driven, AIMD),
+then settling just below the strain. --rate is only a CEILING it will never exceed (default 20),
+so it lands at whichever is smaller: your ceiling or the target's real capacity. Just run it and
+watch 'goslow top'. Use --fixed for an exact, reproducible cap that never adapts.
 
 FLAGS
-  --rate N        starting rate AND ceiling: req/s (HTTP) and conn/s (non-HTTP); over-cap queued; also positional or $RATE
+  --rate N        CEILING: req/s (HTTP) and conn/s (non-HTTP); the gauge ramps up to it; over-cap queued; also positional or $RATE
   --ports LIST    tcp ports treated as HTTP -> mitmproxy (default 80,443); rest -> TCP pacer; or $PORTS
   --refresh SEC   re-resolve hostnames every SEC to track LB/DNS rotation (default 30, 0=off); or $REFRESH
-  --fixed         disable the adaptive governor: hold exactly --rate, never back off (reproducible)
-  --slow-start    adaptive, but START at a floor and ramp UP toward --rate (extra-cautious for unknown/fragile targets)
+  --fixed         disable the adaptive gauge: hold exactly --rate, never ramp or back off (reproducible)
   --http-only     proxy the HTTP ports only; do NOT pace/cap other ports
   --coarse        DROP over-rate conns on ALL in-scope tcp ports, no proxy/CA (cheapest, lossy, no per-request cap)
   --no-install    do not apt-get missing deps (iptables/ipset/mitmproxy)

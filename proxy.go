@@ -56,17 +56,16 @@ func runProxy(cfg *Config, scopeFile string) {
 		"--listen-port", cfg.ProxyPort,
 		"--ssl-insecure", // don't verify the TARGET's cert; pentest targets often self-sign/expire
 		"--showhost")
-	adaptEnv := "1" // adaptive governor is the default; --fixed turns it off
+	// Adaptive gauge is the default (ramp up from a floor, find the safe rate); --fixed turns the
+	// governor off for an exact cap. SLOW_START=1 selects the gauge (the ramp); it's inert when
+	// ADAPT=0. (SLOW_START=0 with ADAPT=1 is the undocumented start-at-ceiling path, tests only.)
+	adaptEnv := "1"
 	if cfg.Fixed {
 		adaptEnv = "0"
 	}
-	slowEnv := "0"
-	if cfg.SlowStart {
-		slowEnv = "1"
-	}
 	mitm.Env = append(os.Environ(),
 		"RATE="+cfg.Rate, "BURST="+cfg.Rate, "SCOPE="+cfg.ConfDir+"/scope.txt",
-		"ADAPT="+adaptEnv, "SLOW_START="+slowEnv)
+		"ADAPT="+adaptEnv, "SLOW_START=1")
 	mitm.Stdout, mitm.Stderr = logf, logf
 	mitm.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: gid}}
 
@@ -154,12 +153,9 @@ func printBanner(cfg *Config, scopeFile string) {
 	if cfg.HTTPOnly {
 		nonHTTP = "   other tcp ports   -> NOT throttled (--http-only)\n"
 	}
-	httpNote := "adaptive; ceiling, backs off on latency/loss"
-	switch {
-	case cfg.Fixed:
-		httpNote = "HARD cap, no back-off (--fixed)"
-	case cfg.SlowStart:
-		httpNote = "adaptive slow-start; ramps up from floor (--slow-start)"
+	httpNote := "adaptive gauge; ramps up to ceiling, settles at target's safe rate"
+	if cfg.Fixed {
+		httpNote = "HARD cap, no ramp/back-off (--fixed)"
 	}
 	fmt.Printf(`
 ==================================================================
