@@ -35,6 +35,8 @@ HARD_RATIO = float(os.getenv("ADAPT_HARD", "4.0"))   # latency this x baseline -
 RECOVER_RATIO = float(os.getenv("ADAPT_RECOVER", "1.3"))  # below this + no loss -> recover
 DECREASE = float(os.getenv("ADAPT_DECREASE", "0.5")) # multiplicative decrease on distress
 GENTLE = float(os.getenv("ADAPT_GENTLE", "0.9"))     # softer decrease on rising latency
+BASE_FLOOR = float(os.getenv("ADAPT_BASE_FLOOR", "0.005"))  # ratio baseline can't dip below this (anti-poison)
+MIN_LAT_SAMPLE = 0.002   # ignore sub-2ms "responses" (resets/cached errors) as healthy-RTT samples
 EWMA_ALPHA = 0.3
 log = logging.getLogger("ratelimit")
 
@@ -131,11 +133,16 @@ class RateLimiter:
         if hs is None:
             hs = self.hoststats[host] = {"win": [], "ewma": lat}
         now = time.monotonic()
+        hs["ewma"] = EWMA_ALPHA * lat + (1 - EWMA_ALPHA) * hs["ewma"]  # tracks CURRENT latency
+        # Only a healthy serve defines the min-RTT baseline. A 5xx (or an instant reset that still
+        # counts as a "response") is NOT the server's healthy floor -- folding one in poisons the
+        # baseline and makes every real response look like a huge latency multiple in `goslow top`.
+        if (status is not None and status >= 500) or lat < MIN_LAT_SAMPLE:
+            return
         hs["win"].append((now, lat))
         cutoff = now - WINDOW
         if hs["win"][0][0] < cutoff:  # trim expired samples
             hs["win"] = [(t, l) for (t, l) in hs["win"] if t >= cutoff]
-        hs["ewma"] = EWMA_ALPHA * lat + (1 - EWMA_ALPHA) * hs["ewma"]
 
     def _adapt_tick(self):
         # Runs once per STATS_EVERY. No awaits -> executes atomically in the single asyncio
@@ -150,9 +157,7 @@ class RateLimiter:
             win = hs["win"]
             if len(win) < MIN_SAMPLES:
                 continue
-            base = min(l for _, l in win)
-            if base <= 0:
-                continue
+            base = max(min(l for _, l in win), BASE_FLOOR)  # floor guards against a poisoned baseline
             ratio = hs["ewma"] / base
             if ratio > worst_ratio:
                 worst_ratio, worst_base, worst_lat = ratio, base, hs["ewma"]
