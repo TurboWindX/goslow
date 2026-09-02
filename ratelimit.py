@@ -224,11 +224,36 @@ class RateLimiter:
         if self.tokens > self.capacity:
             self.tokens = self.capacity
 
+    def _snapshot(self, reqps):
+        top = dict(sorted(self.host_counts.items(), key=lambda kv: kv[1], reverse=True)[:8])
+        return {"ts": time.time(), "cap": self.ceiling, "rate": round(self.rate, 2),
+                "burst": self.capacity, "tokens": round(self.tokens_now(), 2),
+                "allowed": self.allowed, "waiting": self.waiting, "reqps": round(reqps, 2),
+                "scoped": bool(self.hosts or self.nets), "hosts": top,
+                "adapt": self.adapt, "reason": self.adapt_reason, "losses": self.losses,
+                "base_ms": round((self.worst_base or 0) * 1000, 1),
+                "lat_ms": round((self.worst_lat or 0) * 1000, 1),
+                "ratio": round(self.worst_ratio, 2)}
+
+    def _write_snapshot(self, snap):
+        tmp = STATS_FILE + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(snap, f)
+            os.replace(tmp, STATS_FILE)  # atomic swap; readers never see a partial file
+        except OSError as e:
+            log.warning("[ratelimit] stats write failed: %s", e)
+
     async def snapshot_loop(self):
         # Emit a fresh stats snapshot every STATS_EVERY seconds. reqps is measured over the
         # interval (allowed delta / dt), so the reader sees an effective, not cumulative, rate.
+        # Write ONE bootstrap snapshot immediately, before the first sleep: the event loop is up
+        # by the time this coroutine runs, which is at/just before the Go side prints "GOSLOW
+        # ACTIVE", so the stats file exists the moment the banner claims it does. Without it the
+        # first write lands ~1s later and a `goslow top`/`status` fired right after startup reads
+        # "not running" on a proxy that IS running — a needless scare.
         last_allowed, last_t = self.allowed, time.monotonic()
-        tmp = STATS_FILE + ".tmp"
+        self._write_snapshot(self._snapshot(0.0))
         while True:
             await asyncio.sleep(STATS_EVERY)
             if self.adapt:
@@ -237,21 +262,7 @@ class RateLimiter:
             dt = (now - last_t) or 1e-9
             reqps = (self.allowed - last_allowed) / dt
             last_allowed, last_t = self.allowed, now
-            top = dict(sorted(self.host_counts.items(), key=lambda kv: kv[1], reverse=True)[:8])
-            snap = {"ts": time.time(), "cap": self.ceiling, "rate": round(self.rate, 2),
-                    "burst": self.capacity, "tokens": round(self.tokens_now(), 2),
-                    "allowed": self.allowed, "waiting": self.waiting, "reqps": round(reqps, 2),
-                    "scoped": bool(self.hosts or self.nets), "hosts": top,
-                    "adapt": self.adapt, "reason": self.adapt_reason, "losses": self.losses,
-                    "base_ms": round((self.worst_base or 0) * 1000, 1),
-                    "lat_ms": round((self.worst_lat or 0) * 1000, 1),
-                    "ratio": round(self.worst_ratio, 2)}
-            try:
-                with open(tmp, "w") as f:
-                    json.dump(snap, f)
-                os.replace(tmp, STATS_FILE)  # atomic swap; readers never see a partial file
-            except OSError as e:
-                log.warning("[ratelimit] stats write failed: %s", e)
+            self._write_snapshot(self._snapshot(reqps))
 
 limiter = RateLimiter()
 

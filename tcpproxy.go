@@ -242,7 +242,7 @@ func statsWriter(b *bucket) {
 	lastConns := atomic.LoadInt64(&pstats.totalConns)
 	lastT := time.Now()
 	tmp := tcpStatsFile + ".tmp"
-	for range time.Tick(time.Second) {
+	flush := func() {
 		now := time.Now()
 		dt := now.Sub(lastT).Seconds()
 		if dt <= 0 {
@@ -283,15 +283,19 @@ func statsWriter(b *bucket) {
 		}
 		data, err := json.Marshal(snap)
 		if err != nil {
-			continue
+			return
 		}
 		if err := os.WriteFile(tmp, data, 0644); err != nil {
 			if plog != nil {
 				plog.Printf("stats write FAIL: %v", err)
 			}
-			continue
+			return
 		}
 		_ = os.Rename(tmp, tcpStatsFile)
+	}
+	flush() // bootstrap: file exists the instant the pacer is up, before the first 1s tick
+	for range time.Tick(time.Second) {
+		flush()
 	}
 }
 
