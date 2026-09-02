@@ -24,10 +24,10 @@ written at runtime. Auto-installs its deps (`iptables`, `ipset`, `mitmproxy`) on
 
 ## Install (per box)
 
-Grab the binary — no wiki copy-paste:
+Grab the latest static binary from the [releases page](https://github.com/TurboWindX/goslow/releases/latest) — no build, no wiki copy-paste:
 
 ```bash
-curl -fsSL http://<your-host>/goslow -o goslow && chmod +x goslow && sudo mv goslow /usr/local/bin/
+curl -fsSL https://github.com/TurboWindX/goslow/releases/latest/download/goslow -o goslow && chmod +x goslow && sudo mv goslow /usr/local/bin/
 ```
 
 ## Use
