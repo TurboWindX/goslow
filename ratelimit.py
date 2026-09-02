@@ -16,15 +16,20 @@ SCOPE_FILE = os.getenv("SCOPE", "/etc/mitmproxy/scope.txt")
 STATS_FILE = os.getenv("STATS_HTTP", "/tmp/goslow-http-stats.json")
 STATS_EVERY = 1.0
 
-# --- Adaptive back-off (opt-in via --adapt / ADAPT=1) --------------------------------------
+# --- Adaptive back-off (ON BY DEFAULT; disable with --fixed / ADAPT=0) ----------------------
 # A safety governor, not a throughput optimizer: the configured rate is a CEILING the effective
-# rate can only drop BELOW, never exceed. It watches the target the way TCP congestion control
-# watches a link — by DELAY and LOSS, not status codes (a struggling server rarely sends a clean
-# 429/503; it just gets slow, then stops answering). Signals, strongest first: connection
-# loss/timeout, a request stalled with no answer, and per-host latency rising vs its own healthy
-# baseline (windowed min-RTT). On distress: multiplicative decrease (AIMD); when quiet: slow
-# additive recovery back toward the ceiling. Everything is surfaced in `goslow top`.
-ADAPT = os.getenv("ADAPT", "0") == "1"
+# rate can only drop BELOW, never exceed. By default it STARTS AT the ceiling (you asked for N
+# req/s, you get N) and only pulls below it if the target actually struggles, then recovers back
+# up. It watches the target the way TCP congestion control watches a link — by DELAY and LOSS,
+# not status codes (a struggling server rarely sends a clean 429/503; it just gets slow, then
+# stops answering). Signals, strongest first: connection loss/timeout, a request stalled with no
+# answer, and per-host latency rising vs its own healthy baseline (windowed low-percentile RTT).
+# On distress: multiplicative decrease (AIMD); when quiet: slow additive recovery toward the
+# ceiling. SLOW_START (--slow-start) instead begins at the floor and ramps UP for an unknown,
+# possibly fragile target. --fixed disables the governor entirely (exact, reproducible N req/s).
+# Everything is surfaced in `goslow top`.
+ADAPT = os.getenv("ADAPT", "1") == "1"
+SLOW_START = os.getenv("SLOW_START", "0") == "1"
 ADAPT_MIN = float(os.getenv("ADAPT_MIN", str(max(1.0, RATE * 0.1))))  # floor: never throttle below this
 WARMUP = float(os.getenv("ADAPT_WARMUP", "3"))       # observe-only seconds to learn a baseline
 WINDOW = float(os.getenv("ADAPT_WINDOW", "10"))      # rolling seconds for the min-RTT baseline
@@ -45,16 +50,28 @@ class RateLimiter:
         # rate = current EFFECTIVE rate (adapts down); ceiling = the hard cap it never exceeds.
         self.ceiling = RATE
         self.floor = min(ADAPT_MIN, RATE)
-        # Slow-start (adapt only): begin at the floor with a floor-sized burst so the very first
-        # wave can't slam the target before the controller's first tick, then ramp UP toward the
-        # ceiling only while the target stays healthy (TCP-style: exponential until first distress,
-        # additive after). Fixed mode starts at the ceiling with a full burst, as before.
-        if ADAPT:
+        # Start point: by default (adaptive or fixed) begin AT the ceiling with a full burst, so a
+        # user who asked for N req/s gets N and the governor only pulls BELOW on measured distress.
+        # --slow-start instead begins at the floor with a floor-sized burst so the first wave can't
+        # slam an unknown target before the controller's first tick, then ramps UP while healthy
+        # (additive, not exponential — exponential overshoots a fragile target's safe point then
+        # has to slam the brakes).
+        if ADAPT and SLOW_START:
             self.rate = self.capacity = self.tokens = self.floor
             self.slow_start = True
         else:
-            self.rate, self.capacity, self.tokens = RATE, BURST, BURST
+            self.rate, self.capacity = RATE, BURST
             self.slow_start = False
+            if ADAPT:
+                # Adaptive default: run AT the ceiling, but do NOT hand out a full second's worth of
+                # tokens at t=0. A full burst would admit RATE requests simultaneously and could tip
+                # a fragile target past its concurrency cliff before the controller's first tick (a
+                # stall cascade the governor then can't undo — easing the admission rate doesn't
+                # drain requests already hung on the server). Start the bucket near-empty; it refills
+                # at RATE/s, so throughput still reaches RATE within ~1s but the opening is smooth.
+                self.tokens = self.floor
+            else:
+                self.tokens = BURST  # fixed mode keeps the full burst (exact, reproducible)
         self.step = max(1.0, RATE * 0.05)   # additive-increase step on recovery
         self.updated = time.monotonic()
         self.lock = asyncio.Lock()
@@ -279,7 +296,12 @@ def error(flow: http.HTTPFlow):
         limiter.losses += 1
 
 def load(loader):
-    mode = ("adaptive: ceiling %g/s, floor %g/s, backs off on latency/loss" % (limiter.ceiling, limiter.floor)) if ADAPT else "fixed"
+    if not ADAPT:
+        mode = "fixed (hard cap, no back-off)"
+    elif SLOW_START:
+        mode = "adaptive slow-start: floor %g/s -> ceiling %g/s, backs off on latency/loss" % (limiter.floor, limiter.ceiling)
+    else:
+        mode = "adaptive: start %g/s (ceiling), floor %g/s, backs off on latency/loss" % (limiter.ceiling, limiter.floor)
     log.info("[ratelimit] cap=%s req/s burst=%s scope=%s (%d hosts, %d nets) [%s]",
              RATE, BURST, SCOPE_FILE, len(limiter.hosts), len(limiter.nets), mode)
 

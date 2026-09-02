@@ -56,12 +56,17 @@ func runProxy(cfg *Config, scopeFile string) {
 		"--listen-port", cfg.ProxyPort,
 		"--ssl-insecure", // don't verify the TARGET's cert; pentest targets often self-sign/expire
 		"--showhost")
-	adaptEnv := "0"
-	if cfg.Adapt {
-		adaptEnv = "1"
+	adaptEnv := "1" // adaptive governor is the default; --fixed turns it off
+	if cfg.Fixed {
+		adaptEnv = "0"
+	}
+	slowEnv := "0"
+	if cfg.SlowStart {
+		slowEnv = "1"
 	}
 	mitm.Env = append(os.Environ(),
-		"RATE="+cfg.Rate, "BURST="+cfg.Rate, "SCOPE="+cfg.ConfDir+"/scope.txt", "ADAPT="+adaptEnv)
+		"RATE="+cfg.Rate, "BURST="+cfg.Rate, "SCOPE="+cfg.ConfDir+"/scope.txt",
+		"ADAPT="+adaptEnv, "SLOW_START="+slowEnv)
 	mitm.Stdout, mitm.Stderr = logf, logf
 	mitm.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: gid}}
 
@@ -149,9 +154,12 @@ func printBanner(cfg *Config, scopeFile string) {
 	if cfg.HTTPOnly {
 		nonHTTP = "   other tcp ports   -> NOT throttled (--http-only)\n"
 	}
-	httpNote := "HARD per-request"
-	if cfg.Adapt {
-		httpNote = "CEILING; auto-backs-off on latency/loss (--adapt)"
+	httpNote := "adaptive; ceiling, backs off on latency/loss"
+	switch {
+	case cfg.Fixed:
+		httpNote = "HARD cap, no back-off (--fixed)"
+	case cfg.SlowStart:
+		httpNote = "adaptive slow-start; ramps up from floor (--slow-start)"
 	}
 	fmt.Printf(`
 ==================================================================
