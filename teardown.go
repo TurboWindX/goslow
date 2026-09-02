@@ -35,5 +35,10 @@ func teardown(cfg *Config) {
 	// Drop the ipset.
 	_ = runQ("ipset", "destroy", cfg.SetName)
 
+	// Remove live-stats snapshots so `goslow status` after teardown reports "not running"
+	// instead of a stale frame.
+	_ = os.Remove(httpStatsFile)
+	_ = os.Remove(tcpStatsFile)
+
 	fmt.Printf("[*] reverted. CA left trusted (remove: sudo rm %s && sudo update-ca-certificates --fresh)\n", cfg.CADst)
 }

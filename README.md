@@ -38,6 +38,8 @@ sudo goslow scope.txt 50           # 50/s
 sudo goslow --ports 80,443,8443 scope.txt   # treat 8443 as HTTP too (proxy it)
 sudo goslow --http-only scope.txt  # proxy only; leave non-HTTP ports unthrottled
 sudo goslow --coarse scope.txt 20  # iptables-only conn/s cap on ALL ports (no proxy/CA)
+goslow top                         # live dashboard (in another shell) — no sudo
+goslow status                      # one-shot snapshot, then exit — no sudo
 sudo goslow down                   # revert everything
 ```
 
@@ -73,6 +75,37 @@ and completed). `--http-only` if you specifically don't want to touch non-web po
 only when the proxies can't run (mitmproxy won't install, a tool breaks on the MITM'd TLS) — it
 DROPs over-rate connections (lossy) and caps *connections* not *requests*, so keepalive/HTTP2
 web tools slip past.
+
+## Watch it work
+
+While goslow runs, open another shell (**no sudo** — these only read the live stats) and:
+
+```bash
+goslow top       # self-refreshing dashboard, Ctrl-C to exit
+goslow status    # print one frame and exit (scriptable)
+```
+
+```
+ goslow live  ·  cap 20/s  ·  14:39:21
+ ──────────────────────────────────────────────────────────────
+ HTTP  mitmproxy    20.0 req/s  [████████████████████████]  of 20
+   tokens 0.4/20   queue 20 waiting   served 1,284
+ TCP   pacer        11.0 conn/s [█████████████░░░░░░░░░░░]  of 20
+   tokens 0.5/20   active 10   queue 7   conns 59   paced 1.4 KB
+ ──────────────────────────────────────────────────────────────
+ top targets
+   10.0.0.5           [████████████████████████] 1,284
+   10.0.0.5:21        [█████████████████████░░░]   59
+```
+
+- **queue** = requests/connections blocked waiting for a token right now (how much you're backed up).
+- **req/s** (HTTP) / **conn/s** (TCP) = *effective* rate over the last second, so you can see the cap biting.
+- **paced** = client→target bytes forwarded through the TCP pacer; **served** = HTTP requests granted.
+- **top targets** = where the throttled traffic is going (mitmproxy hosts + pacer destinations, merged).
+
+Both engines flush a snapshot to `/tmp/goslow-{http,tcp}-stats.json` once a second; `top`/`status`
+just read those. Absent or >4s stale ⇒ they report *not running*. `--coarse` has no proxy, so it
+has no live stats (it's pure iptables); use it when you don't need the visibility.
 
 ## Build
 

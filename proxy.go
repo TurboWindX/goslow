@@ -150,6 +150,7 @@ func printBanner(cfg *Config, scopeFile string) {
  GOSLOW ACTIVE -> every tool, scoped
    HTTP (tcp/%s)  -> %s req/s   (mitmproxy, HARD per-request)
 %s   scope     : %s  (%d entries)
+   live view : goslow top     (queue depth, effective rate, top targets)  ·  snapshot: goslow status
    proxy log : tail -f /tmp/mitmdump.log
  Cert-verifying tool still errors (rare; most pentest tools skip verify)?
    export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt   # python requests

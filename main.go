@@ -14,6 +14,8 @@
 //   sudo goslow <scope-file> [rate]      hybrid: HTTP req/s cap + non-HTTP conn/s cap
 //   sudo goslow --http-only <scope>      proxy only; non-HTTP ports left unthrottled
 //   sudo goslow --coarse <scope> [rate]  iptables-only conn/s cap, all ports (no proxy/CA)
+//   goslow top                           live dashboard (rate/queue/top targets)
+//   goslow status                        one stats snapshot, then exit
 //   sudo goslow down                     revert everything
 package main
 
@@ -120,6 +122,16 @@ func main() {
 		return
 	}
 
+	// Live observability — read-only, no root needed (just reads the /tmp stats snapshots).
+	if len(args) >= 1 && args[0] == "top" {
+		runTop(cfg)
+		return
+	}
+	if len(args) >= 1 && args[0] == "status" {
+		runStatus(cfg)
+		return
+	}
+
 	scope := parseArgs(cfg, args)
 	if scope == "" {
 		usage()
@@ -213,6 +225,8 @@ USAGE
   sudo goslow <scope-file> [rate]      DEFAULT hybrid: HTTP req/s cap + non-HTTP conn/s cap
   sudo goslow --http-only <scope>      proxy only; leave non-HTTP ports unthrottled
   sudo goslow --coarse <scope> [rate]  iptables-only conn/s cap, all ports (no proxy/CA)
+  goslow top                           live dashboard (rate/queue/top targets); reads a running goslow
+  goslow status                        print one stats snapshot and exit
   sudo goslow down                     revert everything
 
 DEFAULT (hybrid) covers the WHOLE scope: in-scope HTTP ports (--ports) get a HARD per-request

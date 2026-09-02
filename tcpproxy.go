@@ -1,12 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"log"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -14,6 +17,28 @@ import (
 // plog is the pacer's diagnostic log (/tmp/goslow-tcpproxy.log); nil until startTCPPacer runs.
 // It records only startup + failures (a busy brute would make per-connection logging useless).
 var plog *log.Logger
+
+// tcpStatsFile is the live snapshot the pacer flushes every second; `goslow top` / `goslow status`
+// read it (they run as a separate process, so shared memory is not an option — a file is).
+const tcpStatsFile = "/tmp/goslow-tcp-stats.json"
+
+// pstats are live pacer counters (atomics for the scalars; dsts under its own mutex). Read by the
+// per-second statsWriter, never by the hot path except to increment. Global so handleTCP/pacedCopy
+// can bump them without threading a pointer through every call.
+var pstats = struct {
+	active     int64 // connections currently spliced
+	waiting    int64 // connections blocked on the bucket = queue depth
+	totalConns int64 // cumulative connections accepted
+	bytesPaced int64 // cumulative client->server bytes forwarded (paced)
+	mu         sync.Mutex
+	dsts       map[string]int64 // per-destination connection counts (for "top targets")
+}{dsts: map[string]int64{}}
+
+func noteDst(dst string) {
+	pstats.mu.Lock()
+	pstats.dsts[dst]++
+	pstats.mu.Unlock()
+}
 
 // SO_ORIGINAL_DST recovers the pre-REDIRECT destination of a connection nat'd to us.
 const soOriginalDst = 80
@@ -60,6 +85,7 @@ func startTCPPacer(cfg *Config) error {
 	if plog != nil {
 		plog.Printf("pacer listening :%s rate=%d/s burst=%d", cfg.TCPPort, rate, rate)
 	}
+	go statsWriter(b)
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -86,7 +112,13 @@ func handleTCP(client *net.TCPConn, b *bucket) {
 		}
 		return
 	}
-	b.acquire() // pace the new CONNECTION: block until a token frees up (lossless)
+	atomic.AddInt64(&pstats.totalConns, 1)
+	noteDst(dst)
+	// pace the new CONNECTION: block until a token frees up (lossless). Count the wait so the
+	// live view shows real queue depth (this conn-level acquire, not the per-chunk data pacing).
+	atomic.AddInt64(&pstats.waiting, 1)
+	b.acquire()
+	atomic.AddInt64(&pstats.waiting, -1)
 	up, err := markDialer.Dial("tcp", dst)
 	if err != nil {
 		if plog != nil {
@@ -94,6 +126,8 @@ func handleTCP(client *net.TCPConn, b *bucket) {
 		}
 		return
 	}
+	atomic.AddInt64(&pstats.active, 1)
+	defer atomic.AddInt64(&pstats.active, -1)
 	splice(client, up.(*net.TCPConn), b)
 }
 
@@ -124,6 +158,7 @@ func pacedCopy(dst, src *net.TCPConn, b *bucket) {
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return
 			}
+			atomic.AddInt64(&pstats.bytesPaced, int64(n))
 		}
 		if rerr != nil {
 			return
@@ -187,3 +222,77 @@ func (b *bucket) acquire() {
 		time.Sleep(wait)
 	}
 }
+
+// snapshot returns a non-mutating view of the bucket (current tokens + capacity) for display.
+func (b *bucket) snapshot() (tokens, max float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t := b.tokens + time.Since(b.last).Seconds()*b.rate
+	if t > b.max {
+		t = b.max
+	}
+	return t, b.max
+}
+
+// statsWriter flushes /tmp/goslow-tcp-stats.json once a second: current queue depth, active
+// splices, effective conn/s (delta over the interval), paced bytes, and top destinations. The
+// file is swapped atomically so `goslow top` never reads a half-written frame. Absent/stale =>
+// the reader treats the pacer as not running.
+func statsWriter(b *bucket) {
+	lastConns := atomic.LoadInt64(&pstats.totalConns)
+	lastT := time.Now()
+	tmp := tcpStatsFile + ".tmp"
+	for range time.Tick(time.Second) {
+		now := time.Now()
+		dt := now.Sub(lastT).Seconds()
+		if dt <= 0 {
+			dt = 1
+		}
+		conns := atomic.LoadInt64(&pstats.totalConns)
+		connps := float64(conns-lastConns) / dt
+		lastConns, lastT = conns, now
+
+		// copy the top-N destinations out from under the lock
+		pstats.mu.Lock()
+		type kv struct {
+			k string
+			v int64
+		}
+		all := make([]kv, 0, len(pstats.dsts))
+		for k, v := range pstats.dsts {
+			all = append(all, kv{k, v})
+		}
+		pstats.mu.Unlock()
+		sort.Slice(all, func(i, j int) bool { return all[i].v > all[j].v })
+		top := map[string]int64{}
+		for i := 0; i < len(all) && i < 8; i++ {
+			top[all[i].k] = all[i].v
+		}
+
+		tokens, max := b.snapshot()
+		snap := map[string]any{
+			"ts":          float64(now.UnixNano()) / 1e9,
+			"cap":         max,
+			"tokens":      round2(tokens),
+			"active":      atomic.LoadInt64(&pstats.active),
+			"waiting":     atomic.LoadInt64(&pstats.waiting),
+			"total_conns": conns,
+			"bytes_paced": atomic.LoadInt64(&pstats.bytesPaced),
+			"connps":      round2(connps),
+			"dsts":        top,
+		}
+		data, err := json.Marshal(snap)
+		if err != nil {
+			continue
+		}
+		if err := os.WriteFile(tmp, data, 0644); err != nil {
+			if plog != nil {
+				plog.Printf("stats write FAIL: %v", err)
+			}
+			continue
+		}
+		_ = os.Rename(tmp, tcpStatsFile)
+	}
+}
+
+func round2(f float64) float64 { return float64(int64(f*100+0.5)) / 100 }
