@@ -157,7 +157,12 @@ class RateLimiter:
             win = hs["win"]
             if len(win) < MIN_SAMPLES:
                 continue
-            base = max(min(l for _, l in win), BASE_FLOOR)  # floor guards against a poisoned baseline
+            # Baseline = a LOW PERCENTILE (~p20) of the window, not the absolute min. A jittery but
+            # healthy server's fastest sample is unrepresentatively quick; comparing EWMA against
+            # that raw min makes normal variance look like distress. p20 ignores the lucky-fast
+            # tail while still tracking a rate-induced latency climb. Floor guards a poisoned base.
+            lats = sorted(l for _, l in win)
+            base = max(lats[len(lats) // 5], BASE_FLOOR)
             ratio = hs["ewma"] / base
             if ratio > worst_ratio:
                 worst_ratio, worst_base, worst_lat = ratio, base, hs["ewma"]
@@ -256,13 +261,16 @@ def response(flow: http.HTTPFlow):
     # Completed round-trip for an in-scope request -> feed its latency into the baseline.
     if not limiter.adapt:
         return
-    if limiter.inflight.pop(flow.id, None) is None:
+    start = limiter.inflight.pop(flow.id, None)
+    if start is None:
         return  # wasn't tracked (out of scope)
-    try:
-        lat = flow.response.timestamp_end - flow.request.timestamp_start
-    except (TypeError, AttributeError):
-        return
-    if lat and lat > 0:
+    # Measure the SERVER round-trip: from admission (post-acquire, recorded in the request hook)
+    # to the response. NOT from request receipt -- that would include the time the request sat in
+    # goslow's OWN token-bucket queue, so throttling would look like server latency and the
+    # governor would back off in response to its own delay (a feedback loop). We cap what we send;
+    # we must judge the target only by how fast IT answers once we let the request through.
+    lat = time.monotonic() - start
+    if lat > 0:
         limiter.record_latency(flow.request.pretty_host, lat, flow.response.status_code)
 
 def error(flow: http.HTTPFlow):
