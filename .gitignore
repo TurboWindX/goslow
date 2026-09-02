@@ -1,0 +1,12 @@
+# build output — binary is built via `make build`, never committed
+/goslow
+goslow
+*.exe
+
+# go
+/vendor/
+
+# os / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
