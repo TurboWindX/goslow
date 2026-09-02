@@ -3,6 +3,9 @@
 Rate-limit **every** offensive tool on the box (Burp, sqlmap, ffuf, nuclei, curl, Metasploit,
 hydra…), scoped to your targets — one command, whole scope.
 
+> **TL;DR:** `sudo goslow scope.txt` — that's it. It auto-gauges a safe rate and throttles every
+> tool you run against the scope. No flags, no per-tool config, nothing dropped.
+
 Default is **hybrid** and covers the entire scope, not just web:
 
 - **HTTP ports** (`--ports`, default 80,443) → transparent mitmproxy token-bucket → **hard
