@@ -56,8 +56,12 @@ func runProxy(cfg *Config, scopeFile string) {
 		"--listen-port", cfg.ProxyPort,
 		"--ssl-insecure", // don't verify the TARGET's cert; pentest targets often self-sign/expire
 		"--showhost")
+	adaptEnv := "0"
+	if cfg.Adapt {
+		adaptEnv = "1"
+	}
 	mitm.Env = append(os.Environ(),
-		"RATE="+cfg.Rate, "BURST="+cfg.Rate, "SCOPE="+cfg.ConfDir+"/scope.txt")
+		"RATE="+cfg.Rate, "BURST="+cfg.Rate, "SCOPE="+cfg.ConfDir+"/scope.txt", "ADAPT="+adaptEnv)
 	mitm.Stdout, mitm.Stderr = logf, logf
 	mitm.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: gid}}
 
@@ -145,10 +149,14 @@ func printBanner(cfg *Config, scopeFile string) {
 	if cfg.HTTPOnly {
 		nonHTTP = "   other tcp ports   -> NOT throttled (--http-only)\n"
 	}
+	httpNote := "HARD per-request"
+	if cfg.Adapt {
+		httpNote = "CEILING; auto-backs-off on latency/loss (--adapt)"
+	}
 	fmt.Printf(`
 ==================================================================
  GOSLOW ACTIVE -> every tool, scoped
-   HTTP (tcp/%s)  -> %s req/s   (mitmproxy, HARD per-request)
+   HTTP (tcp/%s)  -> %s req/s   (mitmproxy, %s)
 %s   scope     : %s  (%d entries)
    live view : goslow top     (queue depth, effective rate, top targets)  ·  snapshot: goslow status
    proxy log : tail -f /tmp/mitmdump.log
@@ -157,5 +165,5 @@ func printBanner(cfg *Config, scopeFile string) {
    export NODE_EXTRA_CA_CERTS=%s                                  # node
  Ctrl-C to stop and revert everything (or: sudo goslow down).
 ==================================================================
-`, cfg.Ports, cfg.Rate, nonHTTP, scopeFile, ipsetCount(cfg), cfg.CASrc)
+`, cfg.Ports, cfg.Rate, httpNote, nonHTTP, scopeFile, ipsetCount(cfg), cfg.CASrc)
 }

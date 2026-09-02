@@ -65,6 +65,7 @@ frontends, listing its **CIDR** is most airtight.
 | `--rate N` (or positional) | `RATE` | 20 | req/s (HTTP) **and** conn/s (non-HTTP) cap; both queue over-cap traffic |
 | `--ports LIST` | `PORTS` | `80,443` | tcp ports treated as HTTP → mitmproxy; rest → TCP pacer (queued conn cap) |
 | `--refresh SEC` | `REFRESH` | 30 | re-resolve hostnames every SEC (0=off) |
+| `--adapt` | `ADAPT=1` | off | treat `--rate` as a **ceiling**; auto-back-off (HTTP) when the target slows/errors |
 | `--http-only` | | off | proxy HTTP ports only; leave other ports unthrottled |
 | `--coarse` | | off | iptables-only conn cap on ALL ports (no proxy/CA) |
 | `--no-install` | `NO_INSTALL=1` | off | don't apt-get missing deps |
@@ -75,6 +76,33 @@ and completed). `--http-only` if you specifically don't want to touch non-web po
 only when the proxies can't run (mitmproxy won't install, a tool breaks on the MITM'd TLS) — it
 DROPs over-rate connections (lossy) and caps *connections* not *requests*, so keepalive/HTTP2
 web tools slip past.
+
+## Adaptive back-off (`--adapt`)
+
+Not sure what rate the target can take? Set a **ceiling** and let goslow find a safe rate under it:
+
+```bash
+sudo goslow --adapt scope.txt 100     # never exceed 100/s; drop lower if the target strains
+```
+
+With `--adapt`, `--rate` is a **ceiling the effective rate can only fall below, never exceed** — a
+safety governor, not a throughput optimizer. It watches the target like TCP congestion control
+watches a link: by **delay and loss**, not status codes (a struggling server rarely returns a clean
+429/503 — it just gets slow, then stops answering). Signals, strongest first:
+
+1. **connection loss / timeout** (no answer) — hard back-off;
+2. **a request stalled** with no reply past a threshold — hard back-off;
+3. **latency rising** vs each host's own healthy baseline (windowed min-RTT) — ease off before it errors.
+
+It **slow-starts**: rather than opening at the full ceiling (which would let the first wave slam
+the target before it can react), it begins at the floor with a small burst and ramps *up* — fast
+while the target looks healthy, then cautiously — so it probes for a safe rate instead of assuming
+one. On distress it halves the rate (AIMD multiplicative decrease); when things are quiet it climbs
+back toward the ceiling. Everything is visible in `goslow top` (effective vs ceiling rate,
+current server latency vs baseline, losses, and the reason it's backing off). Tunable via env:
+`ADAPT_MIN` (floor, default 10% of ceiling), `ADAPT_SOFT`/`ADAPT_HARD` (latency ratios),
+`ADAPT_STALL` (no-answer seconds), `ADAPT_WARMUP`, `ADAPT_WINDOW`. HTTP only for now — the non-HTTP
+pacer stays at the fixed cap.
 
 ## Watch it work
 

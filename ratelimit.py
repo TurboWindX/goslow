@@ -15,17 +15,60 @@ SCOPE_FILE = os.getenv("SCOPE", "/etc/mitmproxy/scope.txt")
 # atomically every STATS_EVERY seconds; absent/stale => the reader reports "not running".
 STATS_FILE = os.getenv("STATS_HTTP", "/tmp/goslow-http-stats.json")
 STATS_EVERY = 1.0
+
+# --- Adaptive back-off (opt-in via --adapt / ADAPT=1) --------------------------------------
+# A safety governor, not a throughput optimizer: the configured rate is a CEILING the effective
+# rate can only drop BELOW, never exceed. It watches the target the way TCP congestion control
+# watches a link — by DELAY and LOSS, not status codes (a struggling server rarely sends a clean
+# 429/503; it just gets slow, then stops answering). Signals, strongest first: connection
+# loss/timeout, a request stalled with no answer, and per-host latency rising vs its own healthy
+# baseline (windowed min-RTT). On distress: multiplicative decrease (AIMD); when quiet: slow
+# additive recovery back toward the ceiling. Everything is surfaced in `goslow top`.
+ADAPT = os.getenv("ADAPT", "0") == "1"
+ADAPT_MIN = float(os.getenv("ADAPT_MIN", str(max(1.0, RATE * 0.1))))  # floor: never throttle below this
+WARMUP = float(os.getenv("ADAPT_WARMUP", "3"))       # observe-only seconds to learn a baseline
+WINDOW = float(os.getenv("ADAPT_WINDOW", "10"))      # rolling seconds for the min-RTT baseline
+MIN_SAMPLES = int(os.getenv("ADAPT_SAMPLES", "5"))   # per-host samples before a ratio is trusted
+STALL_S = float(os.getenv("ADAPT_STALL", "8"))       # an in-flight request older than this = distress
+SOFT_RATIO = float(os.getenv("ADAPT_SOFT", "2.0"))   # latency this x baseline -> gentle ease
+HARD_RATIO = float(os.getenv("ADAPT_HARD", "4.0"))   # latency this x baseline -> hard back-off
+RECOVER_RATIO = float(os.getenv("ADAPT_RECOVER", "1.3"))  # below this + no loss -> recover
+DECREASE = float(os.getenv("ADAPT_DECREASE", "0.5")) # multiplicative decrease on distress
+GENTLE = float(os.getenv("ADAPT_GENTLE", "0.9"))     # softer decrease on rising latency
+EWMA_ALPHA = 0.3
 log = logging.getLogger("ratelimit")
 
 class RateLimiter:
     def __init__(self):
-        self.rate, self.capacity, self.tokens = RATE, BURST, BURST
+        # rate = current EFFECTIVE rate (adapts down); ceiling = the hard cap it never exceeds.
+        self.ceiling = RATE
+        self.floor = min(ADAPT_MIN, RATE)
+        # Slow-start (adapt only): begin at the floor with a floor-sized burst so the very first
+        # wave can't slam the target before the controller's first tick, then ramp UP toward the
+        # ceiling only while the target stays healthy (TCP-style: exponential until first distress,
+        # additive after). Fixed mode starts at the ceiling with a full burst, as before.
+        if ADAPT:
+            self.rate = self.capacity = self.tokens = self.floor
+            self.slow_start = True
+        else:
+            self.rate, self.capacity, self.tokens = RATE, BURST, BURST
+            self.slow_start = False
+        self.step = max(1.0, RATE * 0.05)   # additive-increase step on recovery
         self.updated = time.monotonic()
         self.lock = asyncio.Lock()
         # observability counters (asyncio is single-threaded -> plain ints are race-free)
         self.allowed = 0        # requests granted a token (cumulative)
         self.waiting = 0        # requests currently blocked in acquire() = queue depth
         self.host_counts = {}   # per-target grant counts, for the "top targets" view
+        # adaptive state
+        self.adapt = ADAPT
+        self.start_ts = time.monotonic()
+        self.hoststats = {}     # host -> {"win": [(ts, latency_s)...], "ewma": s}
+        self.inflight = {}      # flow.id -> monotonic start (for stall detection)
+        self.losses = 0         # cumulative connection errors/timeouts (no answer)
+        self._last_losses = 0
+        self.adapt_reason = "off" if not ADAPT else "warmup"
+        self.worst_ratio, self.worst_base, self.worst_lat = 0.0, None, None
         self.hosts, self.nets = self._load()
     def _load(self):
         hosts, nets = [], []
@@ -82,6 +125,78 @@ class RateLimiter:
         # non-mutating view of the bucket for display (refills lazily only inside acquire())
         return min(self.capacity, self.tokens + (time.monotonic() - self.updated) * self.rate)
 
+    def record_latency(self, host, lat, status):
+        # feed one completed in-scope request into that host's rolling baseline + EWMA.
+        hs = self.hoststats.get(host)
+        if hs is None:
+            hs = self.hoststats[host] = {"win": [], "ewma": lat}
+        now = time.monotonic()
+        hs["win"].append((now, lat))
+        cutoff = now - WINDOW
+        if hs["win"][0][0] < cutoff:  # trim expired samples
+            hs["win"] = [(t, l) for (t, l) in hs["win"] if t >= cutoff]
+        hs["ewma"] = EWMA_ALPHA * lat + (1 - EWMA_ALPHA) * hs["ewma"]
+
+    def _adapt_tick(self):
+        # Runs once per STATS_EVERY. No awaits -> executes atomically in the single asyncio
+        # thread, so mutating rate/capacity/tokens here can't tear an acquire() in progress.
+        now = time.monotonic()
+        if now - self.start_ts < WARMUP:
+            self.adapt_reason = "warmup"
+            return
+        # worst per-host latency ratio (current EWMA vs that host's windowed min-RTT baseline)
+        worst_ratio, worst_base, worst_lat = 0.0, None, None
+        for hs in self.hoststats.values():
+            win = hs["win"]
+            if len(win) < MIN_SAMPLES:
+                continue
+            base = min(l for _, l in win)
+            if base <= 0:
+                continue
+            ratio = hs["ewma"] / base
+            if ratio > worst_ratio:
+                worst_ratio, worst_base, worst_lat = ratio, base, hs["ewma"]
+        self.worst_ratio, self.worst_base, self.worst_lat = worst_ratio, worst_base, worst_lat
+
+        loss = self.losses - self._last_losses
+        self._last_losses = self.losses
+        stall = any((now - t) > STALL_S for t in self.inflight.values())
+        reap = now - max(STALL_S * 3, 60)  # drop abandoned entries so inflight can't leak
+        for fid in [f for f, t in self.inflight.items() if t < reap]:
+            del self.inflight[fid]
+
+        if loss > 0 or stall or worst_ratio >= HARD_RATIO:
+            self.slow_start = False        # first distress ends the ramp -> AIMD from here on
+            self.rate = max(self.floor, self.rate * DECREASE)
+            why = "no-answer/loss" if loss > 0 else ("stall (no reply)" if stall else "latency %.1fx" % worst_ratio)
+            self.adapt_reason = "backoff: " + why
+        elif worst_ratio >= SOFT_RATIO:
+            self.slow_start = False
+            self.rate = max(self.floor, self.rate * GENTLE)
+            self.adapt_reason = "ease: latency %.1fx" % worst_ratio
+        elif worst_ratio and worst_ratio <= RECOVER_RATIO and self.rate < self.ceiling:
+            # healthy + proven (>=MIN_SAMPLES): ramp toward the ceiling ADDITIVELY (+step/tick),
+            # whether ramping up from the floor for the first time or recovering after a back-off.
+            # Deliberately NOT exponential: a governor probing an unknown limit must not overshoot
+            # the safe point (an exponential ramp jumps past it into distress, then has to slam the
+            # brakes). Additive means the worst overshoot is one step, so the latency rise is caught
+            # near the safe rate. burst grows with rate (below), so no sudden admission spike either.
+            self.rate = min(self.ceiling, self.rate + self.step)
+            self.adapt_reason = ("ramping %g/s" % self.rate) if self.slow_start else "recovering"
+        else:
+            # no trusted samples yet, or holding steady. Don't ramp blind.
+            if self.rate >= self.ceiling:
+                self.adapt_reason = "steady"
+            elif worst_ratio == 0:
+                self.adapt_reason = "probing" if self.slow_start else "hold"
+            else:
+                self.adapt_reason = "hold"
+        # burst shrinks with the effective rate (a governor shouldn't let a big bucket punch
+        # through the back-off), and never carry more tokens than the current capacity.
+        self.capacity = self.rate
+        if self.tokens > self.capacity:
+            self.tokens = self.capacity
+
     async def snapshot_loop(self):
         # Emit a fresh stats snapshot every STATS_EVERY seconds. reqps is measured over the
         # interval (allowed delta / dt), so the reader sees an effective, not cumulative, rate.
@@ -89,15 +204,21 @@ class RateLimiter:
         tmp = STATS_FILE + ".tmp"
         while True:
             await asyncio.sleep(STATS_EVERY)
+            if self.adapt:
+                self._adapt_tick()
             now = time.monotonic()
             dt = (now - last_t) or 1e-9
             reqps = (self.allowed - last_allowed) / dt
             last_allowed, last_t = self.allowed, now
             top = dict(sorted(self.host_counts.items(), key=lambda kv: kv[1], reverse=True)[:8])
-            snap = {"ts": time.time(), "cap": self.rate, "burst": self.capacity,
-                    "tokens": round(self.tokens_now(), 2), "allowed": self.allowed,
-                    "waiting": self.waiting, "reqps": round(reqps, 2),
-                    "scoped": bool(self.hosts or self.nets), "hosts": top}
+            snap = {"ts": time.time(), "cap": self.ceiling, "rate": round(self.rate, 2),
+                    "burst": self.capacity, "tokens": round(self.tokens_now(), 2),
+                    "allowed": self.allowed, "waiting": self.waiting, "reqps": round(reqps, 2),
+                    "scoped": bool(self.hosts or self.nets), "hosts": top,
+                    "adapt": self.adapt, "reason": self.adapt_reason, "losses": self.losses,
+                    "base_ms": round((self.worst_base or 0) * 1000, 1),
+                    "lat_ms": round((self.worst_lat or 0) * 1000, 1),
+                    "ratio": round(self.worst_ratio, 2)}
             try:
                 with open(tmp, "w") as f:
                     json.dump(snap, f)
@@ -123,10 +244,31 @@ async def request(flow: http.HTTPFlow):
         limiter.allowed += 1
         key = h or ip or "?"
         limiter.host_counts[key] = limiter.host_counts.get(key, 0) + 1
+        if limiter.adapt:
+            limiter.inflight[flow.id] = time.monotonic()  # for stall / latency tracking
+
+def response(flow: http.HTTPFlow):
+    # Completed round-trip for an in-scope request -> feed its latency into the baseline.
+    if not limiter.adapt:
+        return
+    if limiter.inflight.pop(flow.id, None) is None:
+        return  # wasn't tracked (out of scope)
+    try:
+        lat = flow.response.timestamp_end - flow.request.timestamp_start
+    except (TypeError, AttributeError):
+        return
+    if lat and lat > 0:
+        limiter.record_latency(flow.request.pretty_host, lat, flow.response.status_code)
+
+def error(flow: http.HTTPFlow):
+    # Connection error / timeout / no answer on an in-scope request = a loss (hard distress).
+    if limiter.adapt and limiter.inflight.pop(flow.id, None) is not None:
+        limiter.losses += 1
 
 def load(loader):
-    log.info("[ratelimit] cap=%s req/s burst=%s scope=%s (%d hosts, %d nets)",
-             RATE, BURST, SCOPE_FILE, len(limiter.hosts), len(limiter.nets))
+    mode = ("adaptive: ceiling %g/s, floor %g/s, backs off on latency/loss" % (limiter.ceiling, limiter.floor)) if ADAPT else "fixed"
+    log.info("[ratelimit] cap=%s req/s burst=%s scope=%s (%d hosts, %d nets) [%s]",
+             RATE, BURST, SCOPE_FILE, len(limiter.hosts), len(limiter.nets), mode)
 
 def running():
     # Event loop is up now -> start the background stats writer.

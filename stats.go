@@ -43,7 +43,8 @@ const (
 
 type httpSnap struct {
 	Ts      float64          `json:"ts"`
-	Cap     float64          `json:"cap"`
+	Cap     float64          `json:"cap"`  // ceiling (hard cap)
+	Rate    float64          `json:"rate"` // effective rate (== cap unless adapting)
 	Burst   float64          `json:"burst"`
 	Tokens  float64          `json:"tokens"`
 	Allowed int64            `json:"allowed"`
@@ -51,6 +52,12 @@ type httpSnap struct {
 	Reqps   float64          `json:"reqps"`
 	Scoped  bool             `json:"scoped"`
 	Hosts   map[string]int64 `json:"hosts"`
+	Adapt   bool             `json:"adapt"`
+	Reason  string           `json:"reason"`
+	Losses  int64            `json:"losses"`
+	BaseMs  float64          `json:"base_ms"`
+	LatMs   float64          `json:"lat_ms"`
+	Ratio   float64          `json:"ratio"`
 }
 
 type tcpSnap struct {
@@ -136,10 +143,34 @@ func render(h *httpSnap, hf bool, t *tcpSnap, tf bool, live bool) []string {
 
 	// HTTP section
 	if hf {
-		L = append(L, fmt.Sprintf(" %-6s%-11s%s  %s  %sof %g%s", "HTTP", "mitmproxy",
-			fmt.Sprintf("%6.1f req/s", h.Reqps), bar(h.Reqps, h.Cap, h.Waiting), aDim, h.Cap, aReset))
+		ceiling := h.Cap
+		eff := h.Rate
+		if eff <= 0 {
+			eff = ceiling
+		}
+		right := fmt.Sprintf("%sof %g%s", aDim, ceiling, aReset)
+		if h.Adapt {
+			capc := aGreen
+			if eff < ceiling {
+				capc = aYell
+			}
+			right = fmt.Sprintf("%scap %s%g%s%s/%g%s", aDim, capc, eff, aReset, aDim, ceiling, aReset)
+		}
+		L = append(L, fmt.Sprintf(" %-6s%-11s%s  %s  %s", "HTTP", "mitmproxy",
+			fmt.Sprintf("%6.1f req/s", h.Reqps), bar(h.Reqps, ceiling, h.Waiting), right))
 		L = append(L, fmt.Sprintf("   %stokens %.1f/%g   queue %d waiting   served %s%s",
-			aDim, h.Tokens, h.Cap, h.Waiting, comma(h.Allowed), aReset))
+			aDim, h.Tokens, eff, h.Waiting, comma(h.Allowed), aReset))
+		if h.Adapt {
+			rc := aGreen
+			if eff < ceiling {
+				rc = aYell
+			}
+			lat := ""
+			if h.LatMs > 0 {
+				lat = fmt.Sprintf("%s   srv %.0fms (base %.0fms, %.1f×)   losses %d%s", aDim, h.LatMs, h.BaseMs, h.Ratio, h.Losses, aReset)
+			}
+			L = append(L, fmt.Sprintf("   %s%s%s%s", rc, h.Reason, aReset, lat))
+		}
 	} else {
 		L = append(L, fmt.Sprintf(" %-6s%-11s%s(not running)%s", "HTTP", "mitmproxy", aDim, aReset))
 	}

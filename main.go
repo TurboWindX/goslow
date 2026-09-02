@@ -53,6 +53,7 @@ type Config struct {
 	Tag       string // refresher process marker (for fallback pattern-kill)
 	Coarse    bool
 	HTTPOnly  bool
+	Adapt     bool
 	NoInstall bool
 }
 
@@ -167,6 +168,8 @@ func parseArgs(cfg *Config, args []string) (scope string) {
 			cfg.Coarse = true
 		case a == "--http-only":
 			cfg.HTTPOnly = true
+		case a == "--adapt":
+			cfg.Adapt = true
 		case a == "--no-install":
 			cfg.NoInstall = true
 		case a == "-h" || a == "--help":
@@ -240,6 +243,8 @@ FLAGS
   --rate N        req/s (HTTP) and conn/s (non-HTTP) cap; over-cap traffic is queued; also positional or $RATE
   --ports LIST    tcp ports treated as HTTP -> mitmproxy (default 80,443); rest -> TCP pacer; or $PORTS
   --refresh SEC   re-resolve hostnames every SEC to track LB/DNS rotation (default 30, 0=off); or $REFRESH
+  --adapt         treat --rate as a CEILING and auto-back-off (HTTP) when the target slows/errors
+                  (delay+loss driven, AIMD, never exceeds the cap; watch it in 'goslow top')
   --http-only     proxy the HTTP ports only; do NOT pace/cap other ports
   --coarse        DROP over-rate conns on ALL in-scope tcp ports, no proxy/CA (cheapest, lossy, no per-request cap)
   --no-install    do not apt-get missing deps (iptables/ipset/mitmproxy)
