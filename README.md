@@ -40,7 +40,7 @@ sudo goslow scope.txt              # hybrid: HTTP req/s + non-HTTP conn/s; Ctrl-
 sudo goslow scope.txt 50           # 50/s
 sudo goslow --ports 80,443,8443 scope.txt   # treat 8443 as HTTP too (proxy it)
 sudo goslow --http-only scope.txt  # proxy only; leave non-HTTP ports unthrottled
-sudo goslow --coarse scope.txt 20  # iptables-only conn/s cap on ALL ports (no proxy/CA)
+sudo goslow --coarse scope.txt 50  # iptables-only conn/s cap on ALL ports (no proxy/CA)
 goslow top                         # live dashboard (in another shell) — no sudo
 goslow status                      # one-shot snapshot, then exit — no sudo
 sudo goslow down                   # revert everything
@@ -65,7 +65,7 @@ frontends, listing its **CIDR** is most airtight.
 
 | flag | env | default | meaning |
 |------|-----|---------|---------|
-| `--rate N` (or positional) | `RATE` | 20 | **ceiling**: req/s (HTTP) **and** conn/s (non-HTTP); the gauge ramps up to it; over-cap traffic queues |
+| `--rate N` (or positional) | `RATE` | 50 | **ceiling**: req/s (HTTP) **and** conn/s (non-HTTP); the gauge ramps up to it; over-cap traffic queues |
 | `--ports LIST` | `PORTS` | `80,443` | tcp ports treated as HTTP → mitmproxy; rest → TCP pacer (queued conn cap) |
 | `--refresh SEC` | `REFRESH` | 30 | re-resolve hostnames every SEC (0=off) |
 | `--fixed` | `ADAPT=0` | off | disable the adaptive gauge: hold **exactly** `--rate`, never ramp or back off (reproducible) |
@@ -85,14 +85,21 @@ web tools slip past.
 The HTTP rate is an **adaptive gauge by default** — it figures out how hard it can push the target
 for you. It **starts low and ramps up**, climbing while the target stays healthy and **settling
 just below the point where it starts to struggle**. `--rate N` is only a **ceiling it never
-exceeds** (default 20), so it lands at whichever is smaller: your ceiling or the target's real
+exceeds** (default 50), so it lands at whichever is smaller: your ceiling or the target's real
 capacity. Just point it at the scope and go:
 
 ```bash
-sudo goslow scope.txt          # gauge up toward 20/s; settle lower if the target strains first
+sudo goslow scope.txt          # gauge up toward 50/s; settle lower if the target strains first
 sudo goslow scope.txt 100      # same, but allow it to climb as high as 100/s
 sudo goslow --fixed scope.txt 100   # skip the gauge: hold exactly 100/s (reproducible report runs)
 ```
+
+**Picking the ceiling.** The default (50/s) is a deliberately conservative prod ceiling: gentle for
+any real web app/API, and the gauge settles *below* it on a fragile target anyway. Raise it only
+when you know the target can take it. The gauge backs off on distress it can **measure** (latency,
+loss) — but it's blind to collateral that scales with the raw rate: log/disk floods, IDS/WAF alerts,
+shared-backend DB strain, account lockout. goslow prints a caution when you set the ceiling above
+~150/s for that reason. Treat `--rate` as *"the most I'm ever willing to send,"* not a target.
 
 It watches the target like TCP congestion control watches a link: by **delay and loss**, not status
 codes (a struggling server rarely returns a clean 429/503 — it just gets slow, then stops
@@ -133,12 +140,12 @@ goslow status    # print one frame and exit (scriptable)
 ```
 
 ```
- goslow live  ·  cap 20/s  ·  14:39:21
+ goslow live  ·  cap 50/s  ·  14:39:21
  ──────────────────────────────────────────────────────────────
- HTTP  mitmproxy    20.0 req/s  [████████████████████████]  of 20
-   tokens 0.4/20   queue 20 waiting   served 1,284
- TCP   pacer        11.0 conn/s [█████████████░░░░░░░░░░░]  of 20
-   tokens 0.5/20   active 10   queue 7   conns 59   paced 1.4 KB
+ HTTP  mitmproxy    50.0 req/s  [████████████████████████]  of 50
+   tokens 0.4/50   queue 20 waiting   served 1,284
+ TCP   pacer        27.0 conn/s [█████████████░░░░░░░░░░░]  of 50
+   tokens 0.5/50   active 10   queue 7   conns 59   paced 1.4 KB
  ──────────────────────────────────────────────────────────────
  top targets
    10.0.0.5           [████████████████████████] 1,284

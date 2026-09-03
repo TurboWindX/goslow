@@ -31,9 +31,13 @@ import (
 var addonPy string
 
 const (
-	defRate    = 20
+	defRate    = 50
 	defPorts   = "80,443"
 	defRefresh = 30
+	// warnRate: a ceiling this high on an unknown prod target is worth a heads-up. The gauge
+	// only backs off on distress it can MEASURE (latency/loss); collateral it can't see — log
+	// floods, IDS/WAF alerts, shared-DB strain, account lockout — scales with the absolute rate.
+	warnRate = 150
 )
 
 // Config holds everything the run needs; defaults come from env, then flags/positionals.
@@ -141,6 +145,7 @@ func main() {
 	if _, err := os.Stat(scope); err != nil {
 		die("scope file not readable: %s", scope)
 	}
+	warnHighRate(cfg)
 
 	mustRoot()
 	if cfg.Coarse {
@@ -207,6 +212,20 @@ func parseArgs(cfg *Config, args []string) (scope string) {
 	return scope
 }
 
+// warnHighRate prints a one-line caution when the ceiling is set well above the safe default.
+// It never blocks — the operator asked for a high rate — but the gauge's distress signals are
+// blind to collateral (log/disk floods, IDS/WAF, shared-DB saturation, lockout) that scales with
+// absolute rate, so a high ceiling on an unknown prod target deserves a conscious "yes".
+func warnHighRate(cfg *Config) {
+	if n, err := strconv.Atoi(cfg.Rate); err == nil && n > warnRate {
+		fmt.Fprintf(os.Stderr,
+			"[!] rate ceiling %d/s is high — the gauge backs off on latency/loss it can measure, but\n"+
+				"    NOT on collateral it can't (log floods, IDS/WAF alerts, shared-DB strain, lockout).\n"+
+				"    On an unknown prod target, prefer a lower ceiling unless you know it can take it.\n",
+			n)
+	}
+}
+
 func atoi(s string) int {
 	n, err := strconv.Atoi(s)
 	if err != nil {
@@ -245,7 +264,7 @@ know which services are behind it. (Server replies/downloads are not gated; only
 
 By DEFAULT the HTTP rate is an ADAPTIVE GAUGE: it ramps UP from a low rate and finds the target's
 safe speed for you — climbing until latency rises or connections drop (delay+loss driven, AIMD),
-then settling just below the strain. --rate is only a CEILING it will never exceed (default 20),
+then settling just below the strain. --rate is only a CEILING it will never exceed (default 50),
 so it lands at whichever is smaller: your ceiling or the target's real capacity. Just run it and
 watch 'goslow top'. Use --fixed for an exact, reproducible cap that never adapts.
 

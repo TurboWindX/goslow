@@ -8,7 +8,7 @@ rotation cannot dodge the cap.
 import asyncio, fnmatch, ipaddress, json, logging, os, time
 from mitmproxy import http
 
-RATE = float(os.getenv("RATE", "20"))
+RATE = float(os.getenv("RATE", "50"))
 BURST = float(os.getenv("BURST", str(RATE)))
 SCOPE_FILE = os.getenv("SCOPE", "/etc/mitmproxy/scope.txt")
 # Live-stats snapshot read by `goslow top` / `goslow status` (separate process). Written
